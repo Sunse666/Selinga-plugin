@@ -226,7 +226,11 @@ pub fn single_instance() -> bool {
         };
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let _ = CloseHandle(handle);
-            activate_existing();
+            // 顺序很重要：插件实例建了「重新框选」事件，信号被接住时不该再去抢焦点；
+            // 只有没人接信号（独立版）才退回老行为 —— 把旧窗口拎到前台。
+            if !request_reselect() {
+                activate_existing();
+            }
             return false;
         }
         let _ = handle;
@@ -236,6 +240,101 @@ pub fn single_instance() -> bool {
     #[cfg(not(windows))]
     {
         true
+    }
+}
+
+/// 插件版「重新框选」的命名事件。
+///
+/// 为什么用内核事件而不是窗口消息：宿主重复触发扇区时会拉起**第二份**进程，
+/// 它只活几毫秒、没有窗口可以收消息；命名事件是最便宜的跨进程信令，
+/// `Local\` 前缀保证只在当前登录会话内可见，不与其它会话串扰。
+pub const RESELECT_EVENT_NAME: &str = "Local\\selinga-plugin-reselect";
+
+/// 已运行实例持有的监听端。只有插件模式才创建 —— 独立版的重复启动不该被改行为。
+pub struct ReselectListener {
+    #[cfg(windows)]
+    handle: windows::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+unsafe impl Send for ReselectListener {}
+
+impl ReselectListener {
+    #[cfg(windows)]
+    pub fn create() -> Option<Self> {
+        use windows::Win32::System::Threading::CreateEventW;
+        use windows::core::PCWSTR;
+
+        let name: Vec<u16> = RESELECT_EVENT_NAME.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            CreateEventW(None, false, false, PCWSTR(name.as_ptr()))
+                .ok()
+                .map(|handle| Self { handle })
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn create() -> Option<Self> {
+        None
+    }
+
+    /// 非阻塞查询并消费信号（事件是自动复位的，读到即清除）。
+    #[cfg(windows)]
+    pub fn signaled(&self) -> bool {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::WaitForSingleObject;
+        unsafe { WaitForSingleObject(self.handle, 0) == WAIT_OBJECT_0 }
+    }
+
+    #[cfg(not(windows))]
+    pub fn signaled(&self) -> bool {
+        false
+    }
+}
+
+/// 让已运行的插件实例重新进入框选。返回信号是否真的递送到了。
+#[cfg(windows)]
+pub fn request_reselect() -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+    use windows::core::PCWSTR;
+
+    let name: Vec<u16> = RESELECT_EVENT_NAME.encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        let Ok(handle) = OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR(name.as_ptr())) else {
+            return false;
+        };
+        let delivered = SetEvent(handle).is_ok();
+        let _ = CloseHandle(handle);
+        delivered
+    }
+}
+
+#[cfg(not(windows))]
+pub fn request_reselect() -> bool {
+    false
+}
+
+/// 把 Selinga 自己的窗口拉到前台。
+/// 插件版专用：宿主轮盘刚关闭时前台窗口可能还是宿主，光靠 `ViewportCommand::Focus` 不一定生效。
+pub fn force_foreground() {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            BringWindowToTop, FindWindowW, SetForegroundWindow,
+        };
+        use windows::core::PCWSTR;
+
+        for title in ["Selinga", "Selinga Box"] {
+            let wide: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+            if let Ok(hwnd) = FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr()))
+                && !hwnd.is_invalid()
+            {
+                let _ = SetForegroundWindow(hwnd);
+                let _ = BringWindowToTop(hwnd);
+                return;
+            }
+        }
     }
 }
 

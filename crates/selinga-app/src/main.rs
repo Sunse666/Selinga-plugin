@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 mod settings;
 #[cfg(windows)]
+mod plugin;
 mod tray;
 use settings::Settings;
 #[cfg(windows)]
@@ -175,15 +176,37 @@ fn settings_mtime() -> Option<std::time::SystemTime> {
 
 fn main() -> eframe::Result<()> {
     selinga_platform::enable_per_monitor_dpi();
+    // 插件模式必须在单实例判定之前解析：第二份进程要靠它决定是「重新框选」还是「激活旧窗口」。
+    let plugin = plugin::PluginMode::from_args(std::env::args().skip(1));
+    if let Some(mode) = &plugin {
+        if mode.action != plugin::ACTION_TRANSLATE {
+            log_event(&format!(
+                "starpie: unknown action {:?}, falling back to {}",
+                mode.action,
+                plugin::ACTION_TRANSLATE
+            ));
+        }
+        log_event(&format!(
+            "starpie plugin mode: v{} {}",
+            env!("CARGO_PKG_VERSION"),
+            mode.describe()
+        ));
+    }
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         log_event(&format!("panic: {info}"));
         default_hook(info);
     }));
     if !selinga_platform::single_instance() {
-        log_event("another instance is running; activated it and exited");
+        log_event("another instance is running; signalled it and exited");
         return Ok(());
     }
+    // 只有插件模式才建这个监听器：独立版重复启动仍走「激活旧窗口」的老行为，不改变用户预期。
+    let reselect = if plugin.is_some() {
+        selinga_platform::ReselectListener::create()
+    } else {
+        None
+    };
     let (screen_w, screen_h) = selinga_platform::primary_screen_points();
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("Selinga")
@@ -210,10 +233,10 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Selinga",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             selinga_platform::exclude_self_from_capture();
             install_cjk_fonts(&cc.egui_ctx);
-            Ok(Box::new(SelingaApp::new(&cc.egui_ctx)))
+            Ok(Box::new(SelingaApp::new(&cc.egui_ctx, plugin, reselect)))
         }),
     )
 }
@@ -297,6 +320,10 @@ struct SelingaApp {
     autostart: bool,
     hidden: bool,
     phase: Phase,
+    /// 插件版：`Some` 表示由 StarPie 触发启动，托盘 / 全局热键 / 开机自启全部关闭。
+    plugin: Option<plugin::PluginMode>,
+    /// 已运行实例的「重新框选」信号。独立版为 `None`，行为与之前完全一致。
+    reselect: Option<selinga_platform::ReselectListener>,
     sel_phys: Option<selinga_capture::Region>,
     marquee: Option<(egui::Pos2, egui::Pos2)>,
     show_pending: bool,
@@ -347,23 +374,41 @@ enum WorkerMsg {
 }
 
 impl SelingaApp {
-    fn new(ctx: &egui::Context) -> Self {
+    fn new(
+        ctx: &egui::Context,
+        plugin: Option<plugin::PluginMode>,
+        reselect: Option<selinga_platform::ReselectListener>,
+    ) -> Self {
         #[cfg(windows)]
         let (tx, rx) = std::sync::mpsc::channel();
         let (saved, broken_settings) = Settings::load_or_recover();
-        let target_lang = TARGET_LANGS
-            .iter()
-            .position(|l| *l == saved.target_lang)
-            .unwrap_or(0);
-        let display_mode = display_mode_from(&saved.display_mode);
+        // 宿主显式给了语言就用宿主的；给了未知值则回落到设置，不静默改成默认语言。
+        let target_lang = plugin
+            .as_ref()
+            .and_then(plugin::PluginMode::target_lang_index)
+            .unwrap_or_else(|| {
+                TARGET_LANGS
+                    .iter()
+                    .position(|l| *l == saved.target_lang)
+                    .unwrap_or(0)
+            });
+        let display_mode = plugin
+            .as_ref()
+            .and_then(|mode| mode.display_mode)
+            .unwrap_or_else(|| display_mode_from(&saved.display_mode));
         let settings_mtime = settings_mtime();
+        // 插件版不建托盘，也就不注册那三个全局热键 —— 触发权归宿主，两套热键只会互相抢键。
         #[cfg(windows)]
-        let (tray, tray_error, failed_hotkeys) = match Tray::new(&saved.hotkeys) {
-            Ok(tray) => {
-                let failed = tray.failed.clone();
-                (Some(tray), None, failed)
+        let (tray, tray_error, failed_hotkeys) = if plugin.is_some() {
+            (None, None, Vec::new())
+        } else {
+            match Tray::new(&saved.hotkeys) {
+                Ok(tray) => {
+                    let failed = tray.failed.clone();
+                    (Some(tray), None, failed)
+                }
+                Err(err) => (None, Some(err), Vec::new()),
             }
-            Err(err) => (None, Some(err), Vec::new()),
         };
         let app = Self {
             paused: false,
@@ -418,6 +463,8 @@ impl SelingaApp {
             #[cfg(windows)]
             last_live_capture: Instant::now(),
             t0: Instant::now(),
+            plugin,
+            reselect,
         };
         #[cfg(windows)]
         let app = {
@@ -427,7 +474,10 @@ impl SelingaApp {
                 log_event(&format!("tray unavailable: {err}"));
                 app.notice = Some(format!("托盘不可用：{err}"));
             }
-            if let Err(err) = selinga_platform::set_autostart(app.autostart) {
+            // 插件版不碰注册表自启项：那是独立版的意图，插件的启停由宿主管理。
+            if app.plugin.is_none()
+                && let Err(err) = selinga_platform::set_autostart(app.autostart)
+            {
                 log_event(&format!("autostart sync failed: {err}"));
             }
             if broken_settings.is_some() {
@@ -629,6 +679,19 @@ impl eframe::App for SelingaApp {
         if self.last_exclude.elapsed() > EXCLUDE_INTERVAL {
             self.last_exclude = Instant::now();
             selinga_platform::exclude_self_from_capture();
+        }
+
+        // 宿主再次触发扇区：第二份进程只是给这个事件打了个信号，真正的动作在这里。
+        #[cfg(windows)]
+        if self
+            .reselect
+            .as_ref()
+            .is_some_and(|listener| listener.signaled())
+        {
+            log_event("starpie: reselect requested by host");
+            selinga_platform::force_foreground();
+            self.enter_select_mode(&ctx);
+            ctx.request_repaint();
         }
 
         match self.phase {
