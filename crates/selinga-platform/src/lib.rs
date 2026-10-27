@@ -120,7 +120,8 @@ pub fn set_window_geometry_px(title: &str, x: i32, y: i32, w: i32, h: i32) -> bo
     unsafe {
         use windows::Win32::Foundation::HWND;
         use windows::Win32::UI::WindowsAndMessaging::{
-            FindWindowW, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SetWindowPos,
+            FindWindowW, SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SWP_SHOWWINDOW,
+            SetWindowPos,
         };
         let mut wide: Vec<u16> = title.encode_utf16().collect();
         wide.push(0);
@@ -140,7 +141,10 @@ pub fn set_window_geometry_px(title: &str, x: i32, y: i32, w: i32, h: i32) -> bo
             y,
             w.max(1),
             h.max(1),
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+            // SWP_SHOWWINDOW 不能省：从「框态」回到「选区态」时，ROOT 窗口曾被收成 1×1
+            // 并挪到屏幕外（见 finish_select）。只做移动+缩放的话，Windows 有时不会把它
+            // 重新纳入合成，表现是「SetWindowPos 都成功了，但屏幕上看不见」。
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
         )
         .is_ok()
     }
@@ -149,6 +153,66 @@ pub fn set_window_geometry_px(title: &str, x: i32, y: i32, w: i32, h: i32) -> bo
     {
         let _ = (title, x, y, w, h);
         false
+    }
+}
+
+/// 强制把窗口显示到前台：ShowWindow(SW_SHOW) + SetForegroundWindow。
+///
+/// 与 set_window_geometry_px 配合使用：后者负责位置与尺寸，这一下负责「让它真的出现」。
+/// 插件模式下宿主轮盘刚收起时，前台窗口可能仍是宿主，单靠 egui 的 Focus 命令不一定抢得过来。
+pub fn show_window(title: &str) -> bool {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FindWindowW, SW_SHOW, SetForegroundWindow, ShowWindow,
+        };
+        use windows::core::PCWSTR;
+
+        let wide: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+        let Ok(hwnd) = FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr())) else {
+            return false;
+        };
+        if hwnd.is_invalid() {
+            return false;
+        }
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetForegroundWindow(hwnd);
+        true
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = title;
+        false
+    }
+}
+
+/// 读取窗口的屏幕矩形，仅用于诊断日志（命令都发出了，窗口到底在哪）。
+pub fn window_rect(title: &str) -> Option<(i32, i32, i32, i32)> {
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowRect};
+        use windows::core::PCWSTR;
+
+        let wide: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+        let Ok(hwnd) = FindWindowW(PCWSTR::null(), PCWSTR(wide.as_ptr())) else {
+            return None;
+        };
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return None;
+        }
+        Some((rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top))
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = title;
+        None
     }
 }
 

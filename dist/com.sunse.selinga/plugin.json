@@ -1,0 +1,17 @@
+﻿{
+  "schemaVersion": 1,
+  "id": "com.sunse.selinga",
+  "name": "Selinga 截屏翻译",
+  "description": "框选屏幕区域，识别后译成目标语言，译文贴在原位显示。",
+  "author": "Sunse666",
+  "license": "MIT",
+  "version": "0.4.0",
+  "apiVersion": "1.14",
+  "minHostVersion": "1.0.0",
+  "runtime": "process",
+  "command": [ "bin/selinga.exe", "--starpie-action", "{action}" ],
+  "actions": [
+    { "id": "translate", "displayName": "截屏翻译", "description": "框选后识别并翻译", "category": "效率工具" }
+  ],
+  "capabilities": [ "ScreenCapture", "Ui" ]
+}

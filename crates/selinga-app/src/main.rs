@@ -324,6 +324,8 @@ struct SelingaApp {
     plugin: Option<plugin::PluginMode>,
     /// 已运行实例的「重新框选」信号。独立版为 `None`，行为与之前完全一致。
     reselect: Option<selinga_platform::ReselectListener>,
+    /// 重新框选后「持续重施几何」的截止时刻。见 update() 里 Select 分支的说明。
+    reselect_reassert: Option<Instant>,
     sel_phys: Option<selinga_capture::Region>,
     marquee: Option<(egui::Pos2, egui::Pos2)>,
     show_pending: bool,
@@ -465,6 +467,7 @@ impl SelingaApp {
             t0: Instant::now(),
             plugin,
             reselect,
+            reselect_reassert: None,
         };
         #[cfg(windows)]
         let app = {
@@ -688,14 +691,48 @@ impl eframe::App for SelingaApp {
             .as_ref()
             .is_some_and(|listener| listener.signaled())
         {
-            log_event("starpie: reselect requested by host");
-            selinga_platform::force_foreground();
+            log_event(&format!(
+                "starpie: reselect requested by host (phase={:?}, root={:?})",
+                self.phase,
+                selinga_platform::window_rect("Selinga")
+            ));
             self.enter_select_mode(&ctx);
+            // 框态时 ROOT 被收成 1×1 并挪到屏幕外（见 finish_select）。回到选区态时
+            // 只做 SetWindowPos 不够：窗口未必重新参与合成，屏幕上就是「框没了、选区也不出来」。
+            // 这里显式 ShowWindow + SetForegroundWindow，再持续几帧重施几何抵消旧尺寸。
+            selinga_platform::show_window("Selinga");
+            self.reselect_reassert = Some(Instant::now() + Duration::from_millis(600));
+            log_event(&format!(
+                "starpie: reselect applied (root={:?})",
+                selinga_platform::window_rect("Selinga")
+            ));
             ctx.request_repaint();
         }
 
         match self.phase {
             Phase::Select => {
+                // 重新框选后的收尾：连续几帧把 ROOT 重新铺回虚拟桌面。
+                // 单帧施一次在 DPI 切换与窗口刚被显示的情况下并不可靠。
+                #[cfg(windows)]
+                if let Some(deadline) = self.reselect_reassert {
+                    if Instant::now() < deadline {
+                        let (vx, vy, vw, vh) = selinga_platform::virtual_screen_px();
+                        selinga_platform::set_window_geometry_px(
+                            "Selinga",
+                            vx,
+                            vy,
+                            vw as i32,
+                            vh as i32,
+                        );
+                        ctx.request_repaint();
+                    } else {
+                        self.reselect_reassert = None;
+                        log_event(&format!(
+                            "starpie: reselect geometry settled (root={:?})",
+                            selinga_platform::window_rect("Selinga")
+                        ));
+                    }
+                }
                 #[cfg(windows)]
                 if self.select_bg.is_none() {
                     self.load_select_background(&ctx);
