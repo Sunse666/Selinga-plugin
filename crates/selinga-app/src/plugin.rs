@@ -29,12 +29,17 @@ use crate::{DisplayMode, TARGET_LANGS, display_mode_from};
 /// 宿主经 `--starpie-action` 传入的动作名。
 pub const ACTION_TRANSLATE: &str = "translate";
 
+/// 打开配置文件。宿主把第二个扇区绑到这里，就是一个"插件自己的设置入口"。
+pub const ACTION_SETTINGS: &str = "settings";
+
 #[derive(Debug, Clone)]
 pub struct PluginMode {
     /// 动作名。未知动作按框选翻译处理 —— 宁可多做一次框选，也不要静默什么都不做。
     pub action: String,
     pub target_lang: Option<String>,
     pub display_mode: Option<DisplayMode>,
+    /// 宿主给定的矩形（物理像素）：<c>x,y,w,h</c>。给了就跳过框选层。
+    pub region: Option<(i32, i32, u32, u32)>,
 }
 
 impl PluginMode {
@@ -47,6 +52,7 @@ impl PluginMode {
         let mut action: Option<String> = None;
         let mut target_lang = None;
         let mut display_mode = None;
+        let mut region = None;
         let mut iter = args.into_iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -57,6 +63,11 @@ impl PluginMode {
                         display_mode = Some(display_mode_from(&value));
                     }
                 }
+                "--region" => {
+                    if let Some(value) = iter.next() {
+                        region = parse_region(&value);
+                    }
+                }
                 _ => {}
             }
         }
@@ -65,6 +76,7 @@ impl PluginMode {
             action,
             target_lang,
             display_mode,
+            region,
         })
     }
 
@@ -76,12 +88,33 @@ impl PluginMode {
             .position(|candidate| candidate.eq_ignore_ascii_case(lang))
     }
 
+    /// 宿主给定矩形时转成截屏用的区域。宽高为 0 视为未给。
+    pub fn region(&self) -> Option<selinga_capture::Region> {
+        self.region.map(|(x, y, w, h)| selinga_capture::Region { x, y, w, h })
+    }
+
     pub fn describe(&self) -> String {
         format!(
-            "action={} target_lang={:?} display_mode={:?}",
-            self.action, self.target_lang, self.display_mode
+            "action={} target_lang={:?} display_mode={:?} region={:?}",
+            self.action, self.target_lang, self.display_mode, self.region
         )
     }
+}
+
+/// 解析 `x,y,w,h`（物理像素）。任何一段不合法都整体作废 —— 半个矩形比没有矩形更糟。
+fn parse_region(raw: &str) -> Option<(i32, i32, u32, u32)> {
+    let parts: Vec<&str> = raw.split(',').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    let x: i32 = parts[0].trim().parse().ok()?;
+    let y: i32 = parts[1].trim().parse().ok()?;
+    let w: u32 = parts[2].trim().parse().ok()?;
+    let h: u32 = parts[3].trim().parse().ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((x, y, w, h))
 }
 
 #[cfg(test)]
@@ -126,6 +159,38 @@ mod tests {
         ]))
         .expect("plugin mode");
         assert_eq!(mode.target_lang_index(), None);
+    }
+
+    #[test]
+    fn parses_region_and_rejects_bad_input() {
+        let mode = PluginMode::from_args(args(&[
+            "--starpie-action",
+            "translate",
+            "--region",
+            "100,200,800,400",
+        ]))
+        .expect("plugin mode");
+        assert_eq!(mode.region, Some((100, 200, 800, 400)));
+        assert_eq!(
+            mode.region(),
+            Some(selinga_capture::Region {
+                x: 100,
+                y: 200,
+                w: 800,
+                h: 400
+            })
+        );
+
+        for bad in ["1,2,3", "a,b,c,d", "1,2,0,4", "1,2,3,-4"] {
+            let mode = PluginMode::from_args(args(&[
+                "--starpie-action",
+                "translate",
+                "--region",
+                bad,
+            ]))
+            .expect("plugin mode");
+            assert!(mode.region.is_none(), "非法区域 {bad} 不应被接受");
+        }
     }
 
     #[test]

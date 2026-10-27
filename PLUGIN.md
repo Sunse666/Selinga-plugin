@@ -23,9 +23,10 @@ selinga.exe --starpie-action translate [--target-lang <bcp47>] [--display-mode <
 
 | 参数 | 必填 | 说明 |
 |---|---|---|
-| `--starpie-action` | **是** | 动作名。**只要出现就进入插件模式**；不出现则完全按独立版启动。目前只有 `translate`（启动即框选 → 翻译 → 框常驻）。 |
+| `--starpie-action` | **是** | 动作名。**只要出现就进入插件模式**；不出现则完全按独立版启动。`translate` = 框选翻译；`settings` = 打开配置文件后立即退出（不建窗口）。 |
 | `--target-lang` | 否 | 目标语言，取值来自 `TARGET_LANGS`（`zh-CN`/`en-US`/`ja-JP`/`ko-KR`），大小写不敏感。给未知值时回落到设置里的值，不会静默改成默认语言。 |
 | `--display-mode` | 否 | `bilingual`（双语对照）或 `translated`（纯译文）。缺省用设置里的值。 |
+| `--region x,y,w,h` | 否 | 宿主直接给定的矩形（物理像素）。给了就**跳过框选层**，第一帧进框态。任何一段不合法（段数不对、非数字、宽或高为 0）都整体作废，退回现场框选 —— 半个矩形比没有矩形更糟。 |
 
 退出码：
 
@@ -77,8 +78,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 - **宿主拿不到结果**：v0.5 只有参数 + 退出码，StarPie 不知道译文内容，也不知道是否成功。
   需要结果回流时再上 JSON-RPC（`initialize` / `action.execute`）。
-- **没有 `--region`**：目前总是现场框选。若宿主将来能给出矩形（例如手势起点/终点），
-  加一个 `--region x,y,w,h` 即可跳过框选层。
+- **`--region` 还没有宿主来源**：宿主当前的轮盘会话只暴露圆心、角度与扇区序号
+  （`IHostWheelSessionService`），没有矩形。参数与行为已经就绪，等宿主那边能给出几何信息时
+  直接接上即可。
 - **单实例是全局的**：插件版与独立版共用同一个互斥量，所以两者不能同时运行。
   这是有意的 —— 两套覆盖层同时存在只会互相抢焦点。
 

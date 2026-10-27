@@ -191,6 +191,13 @@ fn main() -> eframe::Result<()> {
             env!("CARGO_PKG_VERSION"),
             mode.describe()
         ));
+
+        // 设置入口：不建窗口、不抢单实例，打开配置文件就退出。
+        // 做成独立动作而不是塞进托盘，是因为插件模式下根本没有托盘。
+        if mode.action == plugin::ACTION_SETTINGS {
+            starpie_open_settings();
+            return Ok(());
+        }
     }
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -239,6 +246,25 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(SelingaApp::new(&cc.egui_ctx, plugin, reselect)))
         }),
     )
+}
+
+/// 打开配置文件。首次运行时先落一份带默认值的文件，否则用户点开只会看到一个空文本。
+fn starpie_open_settings() {
+    let Some(path) = Settings::path() else {
+        log_event("starpie: settings path unavailable");
+        return;
+    };
+
+    if !path.exists() {
+        let (settings, _) = Settings::load_or_recover();
+        settings.save();
+        log_event("starpie: settings file created with defaults");
+    }
+
+    log_event(&format!("starpie: open config {}", path.display()));
+    if let Err(err) = selinga_platform::open_in_editor(&path) {
+        log_event(&format!("starpie: open config failed: {err}"));
+    }
 }
 
 fn app_icon() -> Option<(Vec<u8>, u32, u32)> {
@@ -324,6 +350,8 @@ struct SelingaApp {
     plugin: Option<plugin::PluginMode>,
     /// 已运行实例的「重新框选」信号。独立版为 `None`，行为与之前完全一致。
     reselect: Option<selinga_platform::ReselectListener>,
+    /// 宿主直接给定的矩形：有值时第一帧就跳过框选层，直接进框态。
+    initial_region: Option<selinga_capture::Region>,
     sel_phys: Option<selinga_capture::Region>,
     marquee: Option<(egui::Pos2, egui::Pos2)>,
     show_pending: bool,
@@ -382,6 +410,9 @@ impl SelingaApp {
         #[cfg(windows)]
         let (tx, rx) = std::sync::mpsc::channel();
         let (saved, broken_settings) = Settings::load_or_recover();
+        // 宿主直接给了矩形就跳过框选层；这是「一次触发完成一件事」的最快路径。
+        let initial_region = plugin.as_ref().and_then(plugin::PluginMode::region);
+
         // 宿主显式给了语言就用宿主的；给了未知值则回落到设置，不静默改成默认语言。
         let target_lang = plugin
             .as_ref()
@@ -465,6 +496,7 @@ impl SelingaApp {
             t0: Instant::now(),
             plugin,
             reselect,
+            initial_region,
         };
         #[cfg(windows)]
         let app = {
@@ -679,6 +711,12 @@ impl eframe::App for SelingaApp {
         if self.last_exclude.elapsed() > EXCLUDE_INTERVAL {
             self.last_exclude = Instant::now();
             selinga_platform::exclude_self_from_capture();
+        }
+
+        // 宿主直接给了矩形：第一帧就进框态，不再走框选层。
+        if let Some(region) = self.initial_region.take() {
+            log_event(&format!("starpie: initial region {region:?} -> box"));
+            self.begin_box(&ctx, region);
         }
 
         // 宿主再次触发扇区：第二份进程只是给这个事件打了个信号，真正的动作在这里。
@@ -1020,6 +1058,45 @@ impl SelingaApp {
         }
         eprintln!(
             "selinga: t={}ms root parked offscreen",
+            self.t0.elapsed().as_millis()
+        );
+        ctx.request_repaint();
+    }
+
+    /// 由宿主直接给定矩形：跳过框选层，直接进框态。
+    ///
+    /// 与 finish_select 的尾部刻意保持同构 —— 两处不一致的典型后果是
+    /// “手动选完一切正常、传参进来却不出译文”，而且只在插件模式下复现。
+    fn begin_box(&mut self, ctx: &egui::Context, region: selinga_capture::Region) {
+        self.marquee = None;
+        self.sel_phys = Some(region);
+        self.phase = Phase::Box;
+        self.box_show_pending = true;
+        self.box_pending_frames = 0;
+        self.show_pending = false;
+        self.last_rect = None;
+        self.stable_since = None;
+        self.last_trigger = None;
+        self.result = None;
+        self.translate_error = None;
+        self.notice = None;
+        self.result_ai = false;
+        self.bump_generation();
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::OuterPosition(egui::pos2(-16000.0, -16000.0)),
+        );
+        ctx.send_viewport_cmd_to(
+            egui::ViewportId::ROOT,
+            egui::ViewportCommand::InnerSize(egui::vec2(1.0, 1.0)),
+        );
+        #[cfg(windows)]
+        {
+            self.last_exclude = Instant::now();
+            selinga_platform::exclude_self_from_capture();
+        }
+        eprintln!(
+            "selinga: t={}ms initial region -> box (no marquee)",
             self.t0.elapsed().as_millis()
         );
         ctx.request_repaint();
